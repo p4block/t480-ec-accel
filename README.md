@@ -129,14 +129,12 @@ prevents operation. The status probe writes mailbox arguments and acknowledges
 responses, although it never enables sampling. Other raw EC tools that ignore
 ECLK can interfere; the driver does not override their ownership.
 
-## Repository layout
+## License and related work
 
-- `t480_ec_accel.c`, `Makefile`: firmware-restricted kernel driver.
-- `rotate.py`, `test_rotate.py`: user-space tool and tests.
-- `module.nix`, `package.nix`, `rotate-package.nix`, `flake.nix`: Nix packaging.
-- `PROTOCOL.md`: firmware provenance, command traces, and validation evidence.
+[WTFPL](LICENSE). The original driver's `MODULE_LICENSE("GPL")` compatibility
+tag is retained. No firmware, dumps, calibration, or personal configuration
+is included.
 
-No vendor firmware, machine dumps, calibration data, or personal NixOS
-configuration is included. The original driver's WTFPL SPDX notice is retained;
-see [LICENSE](LICENSE). Its kernel `MODULE_LICENSE("GPL")` declaration is also
-retained from the supplied source.
+Board temperature monitoring belongs in
+[thinkpad-ec-telemetry](https://github.com/p4block/thinkpad-ec-telemetry).
+This repository stays focused on the T480 accelerometer and Sway rotation.

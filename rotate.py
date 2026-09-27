@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import select
 import statistics
+import tempfile
 import subprocess
 import time
 
@@ -19,7 +20,10 @@ STATE = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 't480
 
 def device():
     for path in list_devices():
-        dev = InputDevice(path)
+        try:
+            dev = InputDevice(path)
+        except OSError:
+            continue
         if dev.name == NAME:
             return dev
         dev.close()
@@ -84,11 +88,12 @@ def transform(output, angle):
 
 def load_calibration(path):
     data = json.loads(path.read_text())
-    poses = data['poses']
-    if set(poses) != {'0', '90', '180', '270'}:
+    poses = data.get('poses') if isinstance(data, dict) else None
+    if not isinstance(poses, dict) or set(poses) != {'0', '90', '180', '270'}:
         raise ValueError('Calibration requires all four orientations')
     for xy in poses.values():
-        if len(xy) != 2 or not all(math.isfinite(v) and 0 <= v <= 65535 for v in xy):
+        if not isinstance(xy, list) or len(xy) != 2 or not all(
+                type(v) in (int, float) and math.isfinite(v) and 0 <= v <= 65535 for v in xy):
             raise ValueError('Invalid calibration values')
     separation = min(math.dist(a, b) for i, a in enumerate(poses.values())
                      for b in list(poses.values())[i + 1:])
@@ -122,9 +127,11 @@ def calibrate(args):
             print(f'  X/Y: {poses[angle]}')
     finally:
         transform(output, current)
-    candidate = args.calibration.with_suffix('.tmp')
-    candidate.parent.mkdir(parents=True, exist_ok=True)
-    candidate.write_text(json.dumps({'poses': poses}, indent=2) + '\n')
+    args.calibration.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', dir=args.calibration.parent,
+                                     prefix='.t480-calibration-', delete=False) as file:
+        candidate = Path(file.name)
+        file.write(json.dumps({'poses': poses}, indent=2) + '\n')
     try:
         load_calibration(candidate)
         candidate.replace(args.calibration)
@@ -170,7 +177,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         pass
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         raise SystemExit(str(error))

@@ -28,6 +28,19 @@ class RotationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 r.load_calibration(p)
 
+    def test_malformed_calibration_is_rejected(self):
+        valid = {'0': [512, 312], '90': [312, 512], '180': [512, 712], '270': [712, 512]}
+        cases = [None, [], {}, {'poses': []}]
+        for bad in (None, 'xy', [512], [True, 312], ['512', 312], [float('nan'), 312]):
+            cases.append({'poses': {**valid, '0': bad}})
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'calibration.json'
+            for case in cases:
+                with self.subTest(case=case):
+                    p.write_text(json.dumps(case))
+                    with self.assertRaises(ValueError):
+                        r.load_calibration(p)
+
     def test_stationary_heartbeat_and_stale_timeout(self):
         from types import SimpleNamespace as N
         c = r.ecodes

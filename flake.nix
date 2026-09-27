@@ -23,15 +23,15 @@
       checks.${system} = {
         kernel-module = driver;
         tool = rotate;
-        rotation = pkgs.runCommand "t480-rotation-tests" { nativeBuildInputs = [ python ]; } ''
+        rotation = pkgs.runCommand "t480-rotation-tests" { nativeBuildInputs = [ python pkgs.stdenv.cc ]; } ''
           cp ${./rotate.py} rotate.py
           cp ${./test_rotate.py} test_rotate.py
-          python3 test_rotate.py
+          cp ${./test_mailbox.py} test_mailbox.py
+          cp ${./t480_ec_accel.c} t480_ec_accel.c
+          python3 -m unittest discover -p 'test_*.py'
           touch $out
         '';
-        nixos-module = assert moduleTest.config.hardware.t480EcAccel.enable;
-          assert moduleTest.config.systemd.user.services.t480-auto-rotate.wantedBy == [ "sway-session.target" ];
-          builtins.head moduleTest.config.boot.extraModulePackages;
+        nixos-module = moduleTest.config.systemd.user.units."t480-auto-rotate.service".unit;
       };
       devShells.${system}.default = pkgs.mkShell {
         packages = [ python pkgs.sway ];

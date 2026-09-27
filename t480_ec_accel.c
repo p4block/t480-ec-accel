@@ -56,7 +56,7 @@ static int await_response(u8 command)
 }
 /* Caller holds sensor_lock; ACPI clients use ECLK around each transaction.
  * N24HT37W command 11 is output-only: EC dispatch 2c5dc/2c9e2 overwrites
- * the response without consuming payload arguments. N24HT37W handler builds its response from the sensor ring.
+ * the response from the sensor ring without consuming payload arguments.
  * See PROTOCOL.md for the firmware trace.
  * Other commands preserve payload; successful transactions restore the index.
  * Timeout leaves buffers/index alone while the EC may still be using them.
@@ -113,8 +113,13 @@ static int stop_sensor(void)
   return 0;
  for (i = 0; i < 3; i++) {
   ret = mailbox(0x10, 0, data);
-  if (!ret)
+  if (!ret && data[31])
+   ret = -EIO;
+  if (!ret) {
    ret = mailbox(0x14, 0, data);
+   if (!ret && get_unaligned_le32(data + 28))
+    ret = -EIO;
+  }
   if (!ret) {
    msleep(50);
    ret = mailbox(0x17, 0x82, data);
@@ -145,7 +150,7 @@ static int start_sensor(void)
  if (data[31])
   return -EIO;
  /* Do not take over sampling or self-test started by another client. */
- if (data[0] || data[31])
+ if (data[0])
   return -EBUSY;
  owned = true; /* A power-enable timeout still needs cleanup. */
  ret = mailbox(0x14, 1, data);
@@ -286,6 +291,8 @@ static int __init accel_init(void)
   u8 data[32];
   mutex_lock(&sensor_lock);
   ret = mailbox(0x17, 0x82, data);
+  if (!ret && data[31])
+   ret = -EIO;
   mutex_unlock(&sensor_lock);
   if (!ret)
    pr_info("t480_ec_accel: N24HT37W status=%02x rate=%u filter=%u error=%02x (probe only)\n",
