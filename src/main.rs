@@ -95,16 +95,98 @@ impl LegacyProfile {
     }
 }
 
+// Optional gravity calibration is explicit; old profiles retain their behavior.
+struct GravityProfile {
+    center: [f64; 3],
+    counts_per_g: [f64; 3],
+    directions: [[f64; 2]; 4],
+}
+impl GravityProfile {
+    fn parse(value: &Value, points: [[f64; 2]; 4]) -> Result<Self> {
+        let triple = |key: &str, low: f64, high: f64| -> Result<[f64; 3]> {
+            let values = value[key]
+                .as_array()
+                .filter(|a| a.len() == 3)
+                .ok_or_else(|| format!("gravity.{key} requires three numbers"))?;
+            let mut result = [0.; 3];
+            for i in 0..3 {
+                result[i] = values[i]
+                    .as_f64()
+                    .filter(|v| v.is_finite() && (low..=high).contains(v))
+                    .ok_or_else(|| format!("Invalid gravity.{key}"))?;
+            }
+            Ok(result)
+        };
+        let center = triple("center", 0., 65535.)?;
+        let counts_per_g = triple("counts_per_g", 1., 65535.)?;
+        let mut directions = [[0.; 2]; 4];
+        for i in 0..4 {
+            let x = (points[i][0] - center[0]) / counts_per_g[0];
+            let y = (points[i][1] - center[1]) / counts_per_g[1];
+            let length = x.hypot(y);
+            if length < 0.5 {
+                return Err("Gravity poses must have a substantial in-plane component".into());
+            }
+            directions[i] = [x / length, y / length];
+        }
+        // Neighboring screen transforms must describe successive quarter turns,
+        // and opposite transforms must have opposite gravity directions.
+        for i in 0..4 {
+            let dot = |j: usize| {
+                directions[i][0] * directions[j][0] + directions[i][1] * directions[j][1]
+            };
+            if dot((i + 1) % 4).abs() > 0.5 || dot((i + 2) % 4) > -0.8 {
+                return Err("Gravity poses must describe four perpendicular orientations".into());
+            }
+        }
+        Ok(Self {
+            center,
+            counts_per_g,
+            directions,
+        })
+    }
+    fn classify(&self, axes: [i32; 3], current: Option<&str>) -> Option<&'static str> {
+        let g: [f64; 3] =
+            std::array::from_fn(|i| (axes[i] as f64 - self.center[i]) / self.counts_per_g[i]);
+        let planar = g[0].hypot(g[1]);
+        let magnitude = planar.hypot(g[2]);
+        // Reject motion before interpreting a horizontal pose. Keyboard-up on
+        // a desk means normal; keyboard-down has no preferred screen rotation.
+        if !(0.75..=1.25).contains(&magnitude) {
+            return None;
+        }
+        if planar / magnitude < 0.5 {
+            return (g[2] > 0.).then_some("normal");
+        }
+        let scores = self
+            .directions
+            .map(|d| (g[0] * d[0] + g[1] * d[1]) / planar);
+        // Keep the applied orientation within 55 degrees. A new orientation
+        // must be within 35 degrees, leaving hysteresis around each diagonal.
+        if let Some(i) = current.and_then(|c| ANGLES.iter().position(|a| *a == c)) {
+            if scores[i] >= 55_f64.to_radians().cos() {
+                return Some(ANGLES[i]);
+            }
+        }
+        let i = (0..4).max_by(|a, b| scores[*a].total_cmp(&scores[*b]))?;
+        (scores[i] >= 35_f64.to_radians().cos()).then_some(ANGLES[i])
+    }
+}
+
 // Four measured upright poses; also accepts explicit legacy X230 profiles.
 enum Profile {
     Poses { points: [[f64; 2]; 4], radius: f64 },
     Legacy(LegacyProfile),
+    Gravity(GravityProfile),
 }
 const ANGLES: [&str; 4] = ["normal", "90", "180", "270"];
 impl Profile {
     fn parse(bytes: &[u8]) -> Result<Self> {
         let v: Value = serde_json::from_slice(bytes)?;
         if v.get("poses").is_none() {
+            if v.get("gravity").is_some() {
+                return Err("Gravity calibration requires four rotation poses".into());
+            }
             return Ok(Self::Legacy(LegacyProfile::parse(bytes)?));
         }
         let poses = v["poses"].as_object().ok_or("Invalid poses")?;
@@ -134,13 +216,29 @@ impl Profile {
         if separation < 20. {
             return Err("Calibration poses are not distinct enough".into());
         }
+        if let Some(gravity) = v.get("gravity") {
+            return Ok(Self::Gravity(GravityProfile::parse(gravity, points)?));
+        }
         Ok(Self::Poses {
             points,
             radius: separation * 0.35,
         })
     }
+    fn check_axes(&self, has_z: bool) -> Result<()> {
+        if matches!(self, Self::Gravity(_)) && !has_z {
+            return Err("Gravity profile requires ABS_Z; use a two-axis profile on X230".into());
+        }
+        Ok(())
+    }
+    fn classify_frame(&self, axes: [i32; 3], current: Option<&str>) -> Option<&'static str> {
+        match self {
+            Self::Gravity(p) => p.classify(axes, current),
+            _ => self.classify([axes[0], axes[1]]),
+        }
+    }
     fn classify(&self, axes: [i32; 2]) -> Option<&'static str> {
         match self {
+            Self::Gravity(_) => None, // Three-axis profiles require classify_frame.
             Self::Legacy(p) => p.classify(axes),
             Self::Poses { points, radius } => {
                 let xy = [axes[0] as f64, axes[1] as f64];
@@ -161,14 +259,14 @@ fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
 // evdev suppresses unchanged ABS values. Retain each axis between reports;
 // after an overflow ignore events until SYN_REPORT and obtain a fresh snapshot.
 struct Axes {
-    values: [i32; 2],
+    values: [i32; 3],
     dropped: bool,
 }
 impl Axes {
     fn event(&mut self, kind: u16, code: u16, value: i32) {
         if kind == EV_SYN && code == SYN_DROPPED {
             self.dropped = true;
-        } else if !self.dropped && kind == EV_ABS && code < 2 {
+        } else if !self.dropped && kind == EV_ABS && code < 3 {
             self.values[code as usize] = value;
         }
     }
@@ -450,20 +548,29 @@ impl Rotation<'_> {
     }
 }
 
-fn axes(fd: RawFd) -> Result<[i32; 2]> {
-    let mut result = [0; 2];
-    for (axis, value) in result.iter_mut().enumerate() {
+fn snapshot_axes(has_z: bool, mut read_axis: impl FnMut(usize) -> Result<i32>) -> Result<[i32; 3]> {
+    let mut result = [0; 3];
+    for (axis, value) in result
+        .iter_mut()
+        .enumerate()
+        .take(if has_z { 3 } else { 2 })
+    {
+        *value = read_axis(axis)?;
+    }
+    Ok(result)
+}
+fn axes(fd: RawFd, has_z: bool) -> Result<[i32; 3]> {
+    snapshot_axes(has_z, |axis| {
         // Linux EVIOCGABS(axis), input_absinfo has six signed 32-bit fields.
         let mut info = [0i32; 6];
         // SAFETY: ioctl writes exactly sizeof(input_absinfo) bytes into info.
         if unsafe { libc::ioctl(fd, (0x80184540 + axis) as libc::c_ulong, info.as_mut_ptr()) } < 0 {
             return Err(io::Error::last_os_error().into());
         }
-        *value = info[0];
-    }
-    Ok(result)
+        Ok(info[0])
+    })
 }
-fn check_sensor(fd: RawFd) -> Result<()> {
+fn check_sensor(fd: RawFd) -> Result<bool> {
     let mut name = [0u8; 256];
     // SAFETY: EVIOCGNAME(256) writes at most 256 bytes into name.
     if unsafe { libc::ioctl(fd, 0x81004506 as libc::c_ulong, name.as_mut_ptr()) } < 0 {
@@ -473,12 +580,21 @@ fn check_sensor(fd: RawFd) -> Result<()> {
     if actual != Some(SENSOR_NAME) && actual != Some(b"ThinkPad T480 EC accelerometer") {
         return Err("Unexpected sensor device".into());
     }
-    Ok(())
+    let mut bits = [0u8; 8];
+    // SAFETY: EVIOCGBIT(EV_ABS, 8) writes at most eight bytes into bits.
+    if unsafe { libc::ioctl(fd, 0x80084523 as libc::c_ulong, bits.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    if bits[0] & 3 != 3 {
+        return Err("Sensor must advertise ABS_X and ABS_Y".into());
+    }
+    Ok(bits[0] & 4 != 0)
 }
 struct Sensor {
     file: File,
     cached: Axes,
     recovered: bool,
+    has_z: bool,
 }
 impl Sensor {
     fn open(path: &Path) -> Result<Self> {
@@ -486,18 +602,19 @@ impl Sensor {
             .read(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)?;
-        check_sensor(file.as_raw_fd())?;
-        let values = axes(file.as_raw_fd())?;
+        let has_z = check_sensor(file.as_raw_fd())?;
+        let values = axes(file.as_raw_fd(), has_z)?;
         Ok(Self {
             file,
             recovered: false,
+            has_z,
             cached: Axes {
                 values,
                 dropped: false,
             },
         })
     }
-    fn frame(&mut self, signals: &Signals) -> Result<Option<[i32; 2]>> {
+    fn frame(&mut self, signals: &Signals) -> Result<Option<[i32; 3]>> {
         let deadline = Instant::now() + STALE;
         let mut heartbeat = false;
         loop {
@@ -534,7 +651,7 @@ impl Sensor {
             }
             if event.type_ == EV_SYN && event.code == SYN_REPORT {
                 if self.cached.dropped {
-                    self.cached.values = axes(self.file.as_raw_fd())?;
+                    self.cached.values = axes(self.file.as_raw_fd(), self.has_z)?;
                     self.cached.dropped = false;
                     heartbeat = false;
                 } else if heartbeat {
@@ -550,13 +667,17 @@ fn run_sensor(
     rotation: &mut Rotation<'_>,
     profile: &Profile,
 ) -> Result<()> {
+    profile.check_axes(sensor.has_z)?;
     let mut debounce = Debounce::new(Instant::now());
     while let Some(xy) = sensor.frame(signals)? {
         if sensor.recovered {
             debounce = Debounce::new(Instant::now());
             sensor.recovered = false;
         }
-        if let Some(target) = debounce.update(profile.classify(xy), Instant::now()) {
+        if let Some(target) = debounce.update(
+            profile.classify_frame(xy, Some(&rotation.current)),
+            Instant::now(),
+        ) {
             rotation.set(target)?;
         }
     }
@@ -571,6 +692,12 @@ fn calibrate(
     if args.dry_run {
         return Err("Calibration cannot use --dry-run".into());
     }
+    // Recalibrating rotation directions must not discard an existing six-pose
+    // gravity calibration. New profiles remain two-axis unless explicitly opted in.
+    let gravity = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value.get("gravity").cloned());
     println!("Keep the laptop base near vertical. The sensor is in the base, not the lid.");
     let mut poses = serde_json::Map::new();
     for (i, angle) in ANGLES.iter().enumerate() {
@@ -592,6 +719,9 @@ fn calibrate(
             return Err("Calibration cancelled".into());
         }
         let mut sensor = Sensor::open(&args.device)?;
+        if gravity.is_some() && !sensor.has_z {
+            return Err("Existing gravity calibration requires ABS_Z".into());
+        }
         sensor.frame(signals)?.ok_or("Calibration cancelled")?;
         let mut samples = Vec::new();
         for _ in 0..6 {
@@ -612,7 +742,11 @@ fn calibrate(
         println!("X/Y: {xy:?}");
         poses.insert(["0", "90", "180", "270"][i].into(), serde_json::json!(xy));
     }
-    let bytes = serde_json::to_vec_pretty(&serde_json::json!({"poses":poses}))?;
+    let mut value = serde_json::json!({"poses":poses});
+    if let Some(gravity) = gravity {
+        value["gravity"] = gravity;
+    }
+    let bytes = serde_json::to_vec_pretty(&value)?;
     Profile::parse(&bytes)?;
     save_profile(path, &bytes)?;
     println!("Saved {}", path.display());
@@ -704,7 +838,11 @@ fn run() -> Result<()> {
     if args.mode == "sample" {
         let mut sensor = Sensor::open(&args.device)?;
         while let Some(xy) = sensor.frame(&signals)? {
-            println!("x={} y={}", xy[0], xy[1]);
+            if sensor.has_z {
+                println!("x={} y={} z={}", xy[0], xy[1], xy[2]);
+            } else {
+                println!("x={} y={}", xy[0], xy[1]);
+            }
         }
         return Ok(());
     }

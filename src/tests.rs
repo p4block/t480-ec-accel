@@ -169,26 +169,26 @@ fn dry_run_preserves_original_and_never_uses_ipc() {
 #[test]
 fn axes_keep_unchanged_values_and_discard_overflow_events() {
     let mut a = Axes {
-        values: [572, 571],
+        values: [572, 571, 0],
         dropped: false,
     };
     a.event(EV_ABS, 0, 703);
     a.event(EV_SYN, SYN_REPORT, 0);
-    assert_eq!(a.values, [703, 571]); // Y was suppressed by input core.
+    assert_eq!(a.values, [703, 571, 0]); // Y was suppressed by input core.
     a.event(EV_SYN, SYN_REPORT, 0); // heartbeat-only report
-    assert_eq!(a.values, [703, 571]);
+    assert_eq!(a.values, [703, 571, 0]);
     a.event(EV_ABS, 1, 696);
-    assert_eq!(a.values, [703, 696]);
+    assert_eq!(a.values, [703, 696, 0]);
     a.event(EV_SYN, SYN_DROPPED, 0);
     a.event(EV_ABS, 0, 1);
     a.event(EV_ABS, 1, 2);
     assert!(a.dropped);
-    assert_eq!(a.values, [703, 696]);
+    assert_eq!(a.values, [703, 696, 0]);
     // Caller snapshots both axes at the next SYN_REPORT before resuming.
-    a.values = [369, 564];
+    a.values = [369, 564, 0];
     a.dropped = false;
     a.event(EV_ABS, 1, 565);
-    assert_eq!(a.values, [369, 565]);
+    assert_eq!(a.values, [369, 565, 0]);
 }
 
 #[test]
@@ -235,12 +235,13 @@ fn sensor_requires_fresh_heartbeat() {
     let mut sensor = Sensor {
         file,
         cached: Axes {
-            values: [0, 456],
+            values: [0, 456, 0],
             dropped: false,
         },
         recovered: false,
+        has_z: false,
     };
-    assert_eq!(sensor.frame(&signals).unwrap(), Some([123, 456]));
+    assert_eq!(sensor.frame(&signals).unwrap(), Some([123, 456, 0]));
 }
 
 #[test]
@@ -259,4 +260,183 @@ fn profile_save_refuses_existing_temp_symlink() {
     save_profile(&path, b"{}").unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"{}");
     fs::remove_dir_all(dir).unwrap();
+}
+
+fn gravity_profile() -> Profile {
+    Profile::parse(
+        br#"{
+        "poses":{"0":[712,512],"90":[512,312],"180":[312,512],"270":[512,712]},
+        "gravity":{"center":[512,512,512],"counts_per_g":[200,200,200]}
+    }"#,
+    )
+    .unwrap()
+}
+
+#[test]
+fn gravity_requires_z_and_old_profiles_do_not() {
+    let gravity = gravity_profile();
+    assert!(gravity.check_axes(false).is_err());
+    assert!(gravity.check_axes(true).is_ok());
+    for bytes in [
+        br#"{"center":[572,571],"positive":[131,125],"negative":[203,211]}"#.as_slice(),
+        br#"{"poses":{"0":[512,720],"90":[310,512],"180":[512,310],"270":[720,512]}}"#.as_slice(),
+    ] {
+        let profile = Profile::parse(bytes).unwrap();
+        assert!(profile.check_axes(false).is_ok());
+        for x in (300..740).step_by(20) {
+            for y in (300..740).step_by(20) {
+                let original = profile.classify([x, y]);
+                // X230's unused zero Z and any extra axis must be irrelevant.
+                for z in [0, 512, 720, 65535] {
+                    assert_eq!(profile.classify_frame([x, y, z], Some("90")), original);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn gravity_classifies_cardinal_and_tilted_orientations() {
+    let p = gravity_profile();
+    for (xyz, target) in [
+        ([712, 512, 512], "normal"),
+        ([512, 312, 512], "90"),
+        ([312, 512, 512], "180"),
+        ([512, 712, 512], "270"),
+        // 40 degrees above horizontal, oblique to the cardinal direction.
+        ([632, 462, 672], "normal"),
+        ([462, 392, 352], "90"),
+        ([512, 512, 712], "normal"), // keyboard-up on the desk
+        ([552, 512, 708], "normal"), // slightly tilted desk pose
+    ] {
+        assert_eq!(p.classify_frame(xyz, None), Some(target));
+    }
+    for xyz in [
+        [512, 512, 312], // keyboard-down holds orientation
+        [512, 512, 512], // free fall / no gravity
+        [912, 512, 512], // strong acceleration
+        [587, 512, 512], // acceleration magnitude too low
+        [653, 371, 512], // diagonal without a current orientation
+    ] {
+        assert_eq!(p.classify_frame(xyz, None), None, "{xyz:?}");
+    }
+}
+
+#[test]
+fn gravity_hysteresis_and_motion_reset_dwell() {
+    let p = gravity_profile();
+    let pose = |angle: f64| {
+        let radians = angle.to_radians();
+        [
+            512 + (200. * radians.cos()).round() as i32,
+            512 - (200. * radians.sin()).round() as i32,
+            512,
+        ]
+    };
+    assert_eq!(p.classify_frame(pose(50.), Some("normal")), Some("normal"));
+    assert_eq!(p.classify_frame(pose(56.), Some("normal")), Some("90"));
+    assert_eq!(p.classify_frame(pose(40.), Some("90")), Some("90"));
+    assert_eq!(p.classify_frame(pose(34.), Some("90")), Some("normal"));
+    let start = Instant::now();
+    let mut d = Debounce::new(start);
+    let target = p.classify_frame(pose(90.), Some("normal"));
+    assert_eq!(d.update(target, start), None);
+    assert_eq!(
+        d.update(
+            p.classify_frame([912, 512, 512], Some("normal")),
+            start + Duration::from_millis(900)
+        ),
+        None
+    );
+    assert_eq!(d.update(target, start + Duration::from_millis(1000)), None);
+    assert_eq!(
+        d.update(target, start + Duration::from_millis(2001)),
+        Some("90")
+    );
+}
+
+#[test]
+fn malformed_gravity_calibration_is_rejected() {
+    let base = serde_json::json!({
+        "poses":{"0":[712,512],"90":[512,312],"180":[312,512],"270":[512,712]},
+        "gravity":{"center":[512,512,512],"counts_per_g":[200,200,200]}
+    });
+    for gravity in [
+        serde_json::json!(null),
+        serde_json::json!({"center":[512,512],"counts_per_g":[200,200,200]}),
+        serde_json::json!({"center":[512,512,512],"counts_per_g":[200,0,200]}),
+        serde_json::json!({"center":[512,512,512],"counts_per_g":[200,-1,200]}),
+        serde_json::json!({"center":[true,512,512],"counts_per_g":[200,200,200]}),
+    ] {
+        let mut value = base.clone();
+        value["gravity"] = gravity;
+        assert!(Profile::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+    let mut value = base.clone();
+    value["poses"]["180"] = serde_json::json!([712, 532]);
+    assert!(Profile::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+    let mut value = base.clone();
+    value.as_object_mut().unwrap().remove("poses");
+    assert!(Profile::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+}
+
+#[test]
+fn z_events_are_retained_and_discarded_on_overflow() {
+    let mut axes = Axes {
+        values: [512, 512, 720],
+        dropped: false,
+    };
+    axes.event(EV_ABS, 2, 310);
+    axes.event(EV_SYN, SYN_REPORT, 0);
+    assert_eq!(axes.values, [512, 512, 310]);
+    axes.event(EV_SYN, SYN_DROPPED, 0);
+    axes.event(EV_ABS, 2, 999);
+    assert_eq!(axes.values, [512, 512, 310]);
+    assert!(axes.dropped);
+}
+
+#[test]
+fn x230_snapshots_never_request_abs_z() {
+    let mut requested = Vec::new();
+    let values = snapshot_axes(false, |axis| {
+        requested.push(axis);
+        assert!(axis < 2, "X230 must never receive a Z ioctl");
+        Ok([572, 571][axis])
+    })
+    .unwrap();
+    assert_eq!(requested, [0, 1]);
+    assert_eq!(values, [572, 571, 0]);
+    let values = snapshot_axes(true, |axis| Ok([513, 512, 720][axis])).unwrap();
+    assert_eq!(values, [513, 512, 720]);
+    assert!(snapshot_axes(true, |axis| {
+        if axis == 2 {
+            Err("Z read failed".into())
+        } else {
+            Ok(512)
+        }
+    })
+    .is_err());
+}
+
+#[test]
+fn keyboard_up_returns_to_normal_after_dwell_from_every_rotation() {
+    let p = gravity_profile();
+    for current in ANGLES {
+        let start = Instant::now();
+        let mut debounce = Debounce::new(start);
+        let target = p.classify_frame([513, 512, 720], Some(current));
+        assert_eq!(target, Some("normal"));
+        assert_eq!(debounce.update(target, start), None);
+        assert_eq!(
+            debounce.update(target, start + Duration::from_millis(999)),
+            None
+        );
+        assert_eq!(
+            debounce.update(target, start + Duration::from_millis(1001)),
+            Some("normal")
+        );
+        assert_eq!(p.classify_frame([513, 512, 310], Some(current)), None);
+        // A large Z transient must not look like a keyboard-up desk pose.
+        assert_eq!(p.classify_frame([513, 512, 1000], Some(current)), None);
+    }
 }

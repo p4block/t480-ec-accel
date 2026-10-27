@@ -34,7 +34,7 @@ four calibration poses. At each prompt hold the displayed desktop upright,
 press Enter, then hold still for several seconds. Calibration restores the
 previous display transform, including on cancellation.
 
-Rotation requires one second in a calibrated pose. Ambiguous or flat poses
+With a two-axis profile, rotation requires one second in a calibrated pose. Ambiguous or flat poses
 retain the current transform. A stopped/disconnected sensor stops the program;
 it does not repeatedly reopen the device. Ctrl-C, SIGTERM and errors close
 acquisition and attempt to restore the original display transform.
@@ -44,6 +44,40 @@ Defaults: `/dev/input/thinkpad-ec-accel`, the sole active eDP/LVDS display,
 Use `--device`, `--output`, or `--profile` to override; `--calibration` is an
 alias for `--profile`. `sample` works without Sway. Calibration is required;
 there is no assumed machine-specific profile.
+
+## Optional three-axis gravity rotation
+
+Existing four-pose and legacy X230 profiles keep the same two-axis classifier,
+thresholds and timing. Sensor snapshots read only X/Y when ABS_Z is absent.
+There is no automatic migration based on model or detected axis count.
+
+For a physically calibrated three-axis device, add a `gravity` object to its
+existing four-pose profile:
+
+```json
+"gravity": {
+  "center": [516.8333, 514.5, 518.5833],
+  "counts_per_g": [203, 203, 203]
+}
+```
+
+These example measurements belong to the tested T480; measure your own sensor
+before using gravity mode. Keep the existing `poses` object: it determines
+which gravity direction corresponds to each Sway transform. Use the six-pose
+check in thinkpad-ec to establish center and scale (opposite-pose span / 2).
+Recalibrating screen directions preserves an existing gravity object.
+
+Gravity mode compares the direction of the corrected X/Y projection with the
+four calibrated directions, so tilt does not shrink the matching region as it
+does with distance-based pose matching. Below 30 degrees from horizontal it
+returns to normal when keyboard-up, and holds orientation when keyboard-down.
+It rejects acceleration magnitudes outside 0.75..1.25g and uses
+35-degree entry / 55-degree retention angles to prevent diagonal chatter.
+A new orientation must still persist for one second. These checks reduce
+motion-induced changes but cannot distinguish every movement from gravity.
+A gravity profile requires real ABS_Z support and fails explicitly on X230;
+remove `gravity` to use the original two-axis profile again. `sample` prints Z
+only when the sensor advertises it. The base sensor cannot measure lid angle.
 
 ## Migration
 
